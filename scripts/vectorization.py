@@ -1,76 +1,113 @@
 """
-Phase 2: Vectorization and Local Vector Store Setup
-Module to load processed chunks, generate embeddings, and store them in a local Chroma vector database.
+Phase 2: Vectorization, Local Vector Database Indexing, Metrics, and Persistent Reporting
+Module to generate embeddings and store chunks into ChromaDB for the Northstar RAG pipeline.
 """
 
 import json
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Dict, List, Any
 import chromadb
 from sentence_transformers import SentenceTransformer
 
 
-class VectorIndexer:
-    """Handles text embedding generation and local vector store indexing for Northstar KB."""
+def process_vectorization(
+    chunks_path: str = "data/processed/processed_chunks.jsonl",
+    db_path: str = "data/vector_store",
+    report_path: str = "data/processed/vectorization_report.json",
+    model_name: str = "all-MiniLM-L6-v2",
+    collection_name: str = "northstar_support"
+) -> None:
+    """Reads processed chunks, embeds them, indexes into ChromaDB, and generates a persistent report."""
+    chunks_file = Path(chunks_path)
+    db_dir = Path(db_path)
+    report_file = Path(report_path)
+    
+    report_file.parent.mkdir(parents=True, exist_ok=True)
 
-    def __init__(
-        self,
-        input_path: str = "data/processed/processed_chunks.jsonl",
-        db_path: str = "data/vector_store",
-        model_name: str = "all-MiniLM-L6-v2",
-    ) -> None:
-        self.input_path = Path(input_path)
-        self.db_path = Path(db_path)
-        self.model_name = model_name
-        self.model = SentenceTransformer(model_name)
-        self.client = chromadb.PersistentClient(path=str(self.db_path))
-        self.collection = self.client.get_or_create_collection(name="northstar_support")
+    if not chunks_file.exists():
+        print(f"[Error] Processed chunks file not found at {chunks_path}. Run Phase 1 ingestion first.")
+        return
 
-    def load_chunks(self) -> List[Dict[str, Any]]:
-        """Loads processed chunks from the JSONL output file."""
-        chunks = []
-        if not self.input_path.exists():
-            print(f"[Error] Processed chunks file not found at '{self.input_path}'.")
-            return chunks
+    # Load chunks from JSONL
+    chunks = []
+    with open(chunks_file, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                chunks.append(json.loads(line.strip()))
 
-        with open(self.input_path, "r", encoding="utf-8") as file:
-            for line in file:
-                if line.strip():
-                    chunks.append(json.loads(line))
-        return chunks
+    total_chunks = len(chunks)
+    print(f"[Info] Loaded {total_chunks} chunk(s) from {chunks_path}")
 
-    def index_chunks(self) -> None:
-        """Generates embeddings for chunks and indexes them into the local vector store."""
-        chunks = self.load_chunks()
-        if not chunks:
-            print("[Warning] No chunks available to index.")
-            return
+    if total_chunks == 0:
+        print("[Warning] No chunks found to vectorize.")
+        return
 
-        ids = [chunk["chunk_id"] for chunk in chunks]
-        documents = [chunk["content"] for chunk in chunks]
-        metadatas = [
-            {
-                "document_id": chunk["document_id"],
-                "title": chunk["title"],
-                "chunk_index": chunk["chunk_index"],
-            }
-            for chunk in chunks
-        ]
+    # Initialize embedding model and vector database
+    print(f"[Info] Initializing embedding model: {model_name}")
+    encoder = SentenceTransformer(model_name)
+    
+    # Validate embedding dimension
+    sample_embedding = encoder.encode("Test embedding dimension")
+    embedding_dim = len(sample_embedding)
 
-        print(f"[Info] Generating embeddings for {len(chunks)} chunks using '{self.model_name}'...")
-        embeddings = self.model.encode(documents, show_progress_bar=True).tolist()
+    print(f"[Info] Connecting to ChromaDB persistent store at {db_path}")
+    db_client = chromadb.PersistentClient(path=str(db_dir))
+    
+    # Create or get collection
+    collection = db_client.get_or_create_collection(name=collection_name)
 
-        print(f"[Info] Storing vectors in local Chroma database at '{self.db_path}'...")
-        self.collection.add(
-            ids=ids,
-            documents=documents,
-            embeddings=embeddings,
-            metadatas=metadatas,
-        )
-        print(f"[Success] Successfully indexed {len(chunks)} chunks into the vector store.")
+    # Prepare data for ChromaDB upsert
+    documents = [c["content"] for c in chunks]
+    metadatas = [{
+        "document_id": c["document_id"],
+        "title": c["title"],
+        "chunk_index": c["chunk_index"]
+    } for c in chunks]
+    ids = [c["chunk_id"] for c in chunks]
+    
+    print("[Info] Generating embeddings and indexing into ChromaDB...")
+    embeddings = encoder.encode(documents).tolist()
+
+    collection.upsert(
+        ids=ids,
+        embeddings=embeddings,
+        documents=documents,
+        metadatas=metadatas
+    )
+
+    final_count = collection.count()
+    print(f"[Success] Successfully indexed {final_count} chunks into ChromaDB collection '{collection_name}'")
+
+    # --- Calculate Vectorization Metrics ---
+    metrics_data = {
+        "timestamp": datetime.now().isoformat(),
+        "model_name": model_name,
+        "embedding_dimension": embedding_dim,
+        "collection_name": collection_name,
+        "total_chunks_loaded": total_chunks,
+        "total_chunks_indexed": final_count,
+        "synchronization_status": final_count == total_chunks
+    }
+
+    # Save report persistently to JSON file
+    with open(report_file, "w", encoding="utf-8") as f:
+        json.dump(metrics_data, f, indent=4, ensure_ascii=False)
+
+    print(f"[Success] Persistent vectorization report saved successfully to {report_path}")
+
+    # --- Print Console Summary Report ---
+    print("\n==============================================")
+    print("         VECTORIZATION METRICS REPORT         ")
+    print("==============================================")
+    print(f"• Model Used                : {model_name}")
+    print(f"• Embedding Dimension       : {embedding_dim}")
+    print(f"• Collection Name           : {collection_name}")
+    print(f"• Total Chunks Indexed      : {final_count}")
+    print(f"• Synchronization Status    : {'OK (Matched)' if metrics_data['synchronization_status'] else 'MISMATCH'}")
+    print("==============================================\n")
 
 
 if __name__ == "__main__":
-    print("--- Starting Phase 2: Vectorization and Indexing (Northstar) ---")
-    indexer = VectorIndexer()
-    indexer.index_chunks()
+    print("--- Starting Phase 2: Vectorization & Database Indexing (Northstar) ---")
+    process_vectorization()
